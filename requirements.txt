@@ -1,0 +1,6 @@
+streamlit
+python-dotenv
+websocket-client
+requests
+pandas
+plotly
