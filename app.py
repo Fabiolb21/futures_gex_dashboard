@@ -301,31 +301,54 @@ def connect_websocket(token):
         "keepaliveTimeout": 60, "acceptKeepaliveTimeout": 60, "version": "1.0.0"
     }))
 
-    # Wait for AUTH_STATE and authorize
+    # Send AUTH immediately after SETUP — dxFeed expects this flow:
+    # Client: SETUP -> Server: SETUP -> Server: AUTH_STATE(UNAUTHORIZED)
+    # Client: AUTH  -> Server: AUTH_STATE(AUTHORIZED)
+    # But sometimes AUTH_STATE arrives before we loop, so we send AUTH proactively too.
+
+    auth_sent = False
     authorized = False
-    for _ in range(20):
+    deadline = time.time() + 30  # 30 second timeout
+
+    while time.time() < deadline:
         try:
+            ws.settimeout(2)
             raw = ws.recv()
             if not raw:
                 continue
             msg = json.loads(raw)
-        except (ValueError, Exception):
+        except Exception:
             continue
 
         mtype = msg.get("type")
+
         if mtype == "SETUP":
-            continue
-        if mtype == "AUTH_STATE":
-            if msg.get("state") == "UNAUTHORIZED":
+            # Server acknowledged our SETUP — now send AUTH proactively
+            if not auth_sent:
                 ws.send(json.dumps({"type": "AUTH", "channel": 0, "token": token}))
-            elif msg.get("state") == "AUTHORIZED":
+                auth_sent = True
+
+        elif mtype == "AUTH_STATE":
+            state = msg.get("state")
+            if state == "UNAUTHORIZED":
+                # Send AUTH (or resend if needed)
+                ws.send(json.dumps({"type": "AUTH", "channel": 0, "token": token}))
+                auth_sent = True
+            elif state == "AUTHORIZED":
                 authorized = True
                 break
-        if mtype == "KEEPALIVE":
+
+        elif mtype == "KEEPALIVE":
             ws.send(json.dumps({"type": "KEEPALIVE", "channel": 0}))
 
+        elif mtype == "ERROR":
+            raise Exception(f"dxFeed error: {msg.get('message', msg)}")
+
     if not authorized:
-        raise Exception("dxFeed WebSocket: falha na autenticação")
+        raise Exception(
+            "dxFeed WebSocket: falha na autenticação. "
+            "O streamer token pode ter expirado — tente recarregar o app."
+        )
 
     # Request FEED channel
     ws.send(json.dumps({
@@ -334,13 +357,15 @@ def connect_websocket(token):
     }))
 
     # Wait for CHANNEL_OPENED
-    for _ in range(20):
+    deadline2 = time.time() + 15
+    while time.time() < deadline2:
         try:
+            ws.settimeout(2)
             raw = ws.recv()
             if not raw:
                 continue
             msg = json.loads(raw)
-        except (ValueError, Exception):
+        except Exception:
             continue
 
         mtype = msg.get("type")
@@ -348,6 +373,12 @@ def connect_websocket(token):
             break
         if mtype == "KEEPALIVE":
             ws.send(json.dumps({"type": "KEEPALIVE", "channel": 0}))
+        if mtype == "AUTH_STATE" and msg.get("state") == "AUTHORIZED":
+            # Sometimes AUTH confirmation arrives after CHANNEL_REQUEST
+            ws.send(json.dumps({
+                "type": "CHANNEL_REQUEST", "channel": 1,
+                "service": "FEED", "parameters": {"contract": "AUTO"}
+            }))
 
     return ws
 
@@ -766,7 +797,9 @@ def main():
             with st.spinner(f"Buscando Greeks para {len(opts)} opções..."):
                 try:
                     prog.info(f"🔌 Conectando ao dxFeed WebSocket...")
-                    token = ensure_streamer_token()
+                    # Force fresh token on Streamlit Cloud to avoid cached expired tokens
+                    from utils.auth import get_streamer_token
+                    token = get_streamer_token(force_refresh=True)
                     ws = connect_websocket(token)
 
                     prog.info(f"📊 Coletando Greeks para {len(opts)} opções ({wait_seconds}s)...")
