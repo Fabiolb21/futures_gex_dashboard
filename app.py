@@ -898,7 +898,7 @@ def main():
         if load_chain:
             with st.spinner(f"Buscando option chain de {cfg['tasty_symbol']}..."):
                 try:
-                    access_token, _ = get_fresh_tokens()
+                    access_token, _, _ws_url_ignored = get_fresh_tokens()
                     expirations = get_futures_option_chain(access_token, cfg["tasty_symbol"])
                     
                     if not expirations:
