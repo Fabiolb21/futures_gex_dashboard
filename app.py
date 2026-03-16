@@ -18,12 +18,12 @@ from utils.auth import get_access_token, ensure_streamer_token, get_streamer_tok
 
 def get_fresh_tokens():
     """
-    Fetch access token + streamer token in a single flow with no file cache.
-    Returns (access_token, streamer_token).
-    Critical for Streamlit Cloud where the filesystem is not persistent.
+    Fetch access token + streamer token + websocket URL in a single flow.
+    Returns (access_token, streamer_token, websocket_url).
     
-    IMPORTANT: Call this ONCE per WebSocket session. Calling get_access_token
-    multiple times invalidates previous tokens on the dxFeed side.
+    CRITICAL: The /api-quote-tokens endpoint returns a session-specific
+    websocket-url that MUST be used — the hardcoded URL causes
+    'Session not found' errors.
     """
     from utils.auth import load_credentials_from_env
 
@@ -41,10 +41,10 @@ def get_fresh_tokens():
     )
     if resp.status_code != 200:
         raise Exception(f"Falha ao obter access token: {resp.status_code} {resp.text[:200]}")
-    
+
     access_token = resp.json()["access_token"]
 
-    # Step 2: Get streamer token using the access token just obtained
+    # Step 2: Get streamer token + websocket URL
     resp2 = requests.get(
         "https://api.tastyworks.com/api-quote-tokens",
         headers={"Authorization": f"Bearer {access_token}"},
@@ -52,12 +52,20 @@ def get_fresh_tokens():
     )
     if resp2.status_code != 200:
         raise Exception(f"Falha ao obter streamer token: {resp2.status_code} {resp2.text[:200]}")
-    
-    streamer_token = resp2.json().get("data", {}).get("token")
+
+    data = resp2.json().get("data", {})
+    streamer_token = data.get("token")
+    # The API returns the exact WebSocket URL to use for this session
+    websocket_url = data.get("websocket-url") or data.get("dxlink-url") or DXFEED_URL
+
     if not streamer_token:
         raise Exception(f"Streamer token não encontrado: {resp2.json()}")
-    
-    return access_token, streamer_token
+
+    # Ensure WSS protocol
+    if websocket_url and not websocket_url.startswith("wss://"):
+        websocket_url = websocket_url.replace("https://", "wss://").replace("http://", "wss://")
+
+    return access_token, streamer_token, websocket_url
 from utils.gex_calculator import GEXCalculator
 
 st.set_page_config(
@@ -332,12 +340,12 @@ def get_active_streamer_symbol(access_token, tasty_symbol):
 
 # ── WebSocket helpers ─────────────────────────────────────
 
-def connect_websocket(token):
+def connect_websocket(token, url=None):
     """
     Connect and authenticate with dxFeed WebSocket.
-    Mirrors exactly the flow used in the working SPX GEX dashboard.
+    Uses the session-specific URL returned by /api-quote-tokens when available.
     """
-    ws = create_connection(DXFEED_URL, timeout=20)
+    ws = create_connection(url or DXFEED_URL, timeout=20)
 
     # SETUP
     ws.send(json.dumps({
@@ -915,8 +923,8 @@ def main():
                         price = None
                         if active_streamer:
                             try:
-                                _, _st = get_fresh_tokens()
-                                ws_p = connect_websocket(_st)
+                                _, _st, _ws_url = get_fresh_tokens()
+                                ws_p = connect_websocket(_st, url=_ws_url)
                                 # Try both Trade and Quote for the active contract
                                 ws_p.send(json.dumps({
                                     "type": "FEED_SUBSCRIPTION", "channel": 1,
@@ -1087,13 +1095,10 @@ def main():
             prog = st.empty()
             with st.spinner(f"Buscando Greeks para {len(opts)} opções..."):
                 try:
-                    prog.info(f"🔑 Obtendo tokens...")
-                    _, streamer_token = get_fresh_tokens()
-                    # Show token preview for debugging
-                    token_preview = f"{streamer_token[:20]}...{streamer_token[-10:]}" if len(streamer_token) > 30 else streamer_token
-                    st.caption(f"Token: `{token_preview}` (len={len(streamer_token)})")
-                    prog.info(f"🔌 Conectando ao dxFeed WebSocket...")
-                    ws = connect_websocket(streamer_token)
+                    prog.info(f"🔑 Obtendo tokens e URL da sessão...")
+                    _, streamer_token, ws_url = get_fresh_tokens()
+                    prog.info(f"🔌 Conectando ao dxFeed ({ws_url[:40]}...)...")
+                    ws = connect_websocket(streamer_token, url=ws_url)
 
                     prog.info(f"📊 Coletando Greeks para {len(opts)} opções ({wait_seconds}s)...")
                     option_data = fetch_greeks_for_options(ws, opts, wait_seconds)
