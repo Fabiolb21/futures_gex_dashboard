@@ -530,59 +530,77 @@ def main():
                         active_streamer = get_active_streamer_symbol(access_token, cfg["tasty_symbol"])
                         st.session_state.active_streamer_symbol = active_streamer
                         
-                        # Try REST price first
-                        price = get_futures_price_rest(access_token, cfg["tasty_symbol"])
-                        
-                        # Fallback: fetch via dxFeed WebSocket using the streamer symbol
-                        if not price and active_streamer:
+                        # Try WebSocket price using the active streamer symbol
+                        price = None
+                        if active_streamer:
                             try:
                                 token_ws = ensure_streamer_token()
                                 ws_p = connect_websocket(token_ws)
+                                # Try both Trade and Quote for the active contract
                                 ws_p.send(json.dumps({
                                     "type": "FEED_SUBSCRIPTION", "channel": 1,
                                     "add": [
                                         {"symbol": active_streamer, "type": "Trade"},
                                         {"symbol": active_streamer, "type": "Quote"},
+                                        # Also try without exchange suffix
+                                        {"symbol": active_streamer.split(":")[0], "type": "Trade"},
+                                        {"symbol": active_streamer.split(":")[0], "type": "Quote"},
                                     ]
                                 }))
+                                candidates = {active_streamer, active_streamer.split(":")[0]}
                                 t0 = time.time()
-                                while time.time() - t0 < 8:
+                                while time.time() - t0 < 10 and not price:
                                     try:
                                         ws_p.settimeout(1)
                                         m = json.loads(ws_p.recv())
                                         if m.get("type") == "FEED_DATA":
                                             for item in m.get("data", []):
-                                                if item.get("eventSymbol") == active_streamer:
-                                                    p = item.get("price")
-                                                    if not p:
-                                                        b = item.get("bidPrice") or 0
-                                                        a = item.get("askPrice") or 0
-                                                        p = (float(b)+float(a))/2 if b and a else None
-                                                    if p:
-                                                        try:
-                                                            fv = float(p)
-                                                            if fv > 0:
-                                                                price = fv
-                                                        except Exception:
-                                                            pass
-                                        if price:
-                                            break
+                                                if item.get("eventSymbol") not in candidates:
+                                                    continue
+                                                # Trade price
+                                                p = item.get("price")
+                                                if p and str(p) not in ("NaN","nan",""):
+                                                    try:
+                                                        fv = float(p)
+                                                        if fv > 0:
+                                                            price = fv
+                                                            break
+                                                    except Exception:
+                                                        pass
+                                                # Quote midpoint
+                                                b = item.get("bidPrice")
+                                                a = item.get("askPrice")
+                                                if b and a:
+                                                    try:
+                                                        fv = (float(b) + float(a)) / 2
+                                                        if fv > 0:
+                                                            price = fv
+                                                            break
+                                                    except Exception:
+                                                        pass
                                     except Exception:
                                         pass
                                 ws_p.close()
                             except Exception:
                                 pass
-                        
+
+                        # Fallback: REST API
+                        if not price:
+                            price = get_futures_price_rest(access_token, cfg["tasty_symbol"])
+
                         if price:
                             st.session_state.underlying_price = price
-                        
+
                         n_exp = len(expirations)
                         total_opts = sum(len(v) for v in expirations.values())
                         st.success(f"✅ {n_exp} expirações · {total_opts} opções carregadas!")
                         if price:
-                            st.info(f"💰 Preço ativo ({active_streamer or cfg['tasty_symbol']}): {price:,.4f}")
+                            st.info(f"💰 {active_streamer or cfg['tasty_symbol']}: **{price:,.2f}**")
                         else:
-                            st.warning(f"Preço não disponível via API. Usando padrão: {cfg['default_price']:,.2f}")
+                            st.warning(
+                                f"Preço não obtido automaticamente. "
+                                f"Insira manualmente abaixo antes de fazer o Fetch."
+                            )
                         if active_streamer:
                             st.caption(f"Contrato ativo: {active_streamer}")
                 except Exception as e:
@@ -617,6 +635,22 @@ def main():
             opts_for_exp = st.session_state.chain_options.get(chosen_exp, [])
             n_strikes = len(set(o["strike"] for o in opts_for_exp))
             st.caption(f"{len(opts_for_exp)} opções · {n_strikes} strikes")
+
+            # Manual price override
+            st.markdown("**💲 Preço do Contrato**")
+            current_price = st.session_state.underlying_price or float(cfg["default_price"])
+            manual_price = st.number_input(
+                "Preço atual",
+                min_value=0.01,
+                max_value=1_000_000.0,
+                value=float(current_price),
+                step=float(cfg["increment"]),
+                format="%.2f",
+                help="Preço obtido automaticamente. Edite se necessário.",
+                label_visibility="collapsed"
+            )
+            if manual_price != current_price:
+                st.session_state.underlying_price = manual_price
 
             # Strike range filter
             st.markdown("**Filtro de Strikes (opcional)**")
