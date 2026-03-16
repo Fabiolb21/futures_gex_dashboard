@@ -335,6 +335,253 @@ def get_active_streamer_symbol(access_token, tasty_symbol):
 def connect_websocket(token):
     """
     Connect and authenticate with dxFeed WebSocket.
+    Mirrors exactly the flow used in the working SPX GEX dashboard.
+    """
+    ws = create_connection(DXFEED_URL, timeout=20)
+
+    # SETUP
+    ws.send(json.dumps({
+        "type": "SETUP", "channel": 0,
+        "keepaliveTimeout": 60, "acceptKeepaliveTimeout": 60, "version": "1.0.0"
+    }))
+
+    # Wait for server SETUP ack, then AUTH_STATE(UNAUTHORIZED), then send AUTH
+    # Exactly like the original working app
+    deadline = time.time() + 30
+    authorized = False
+
+    while time.time() < deadline:
+        try:
+            ws.settimeout(3)
+            raw = ws.recv()
+            if not raw or not raw.strip():
+                continue
+            msg = json.loads(raw)
+        except ValueError:
+            continue
+        except Exception:
+            continue
+
+        mtype = msg.get("type", "")
+
+        if mtype == "AUTH_STATE":
+            state = msg.get("state", "")
+            if state == "UNAUTHORIZED":
+                # Only send AUTH when server explicitly asks — exactly like original app
+                ws.send(json.dumps({"type": "AUTH", "channel": 0, "token": token}))
+            elif state == "AUTHORIZED":
+                authorized = True
+                break
+
+        elif mtype == "KEEPALIVE":
+            ws.send(json.dumps({"type": "KEEPALIVE", "channel": 0}))
+
+        elif mtype == "ERROR":
+            err_msg = msg.get("message", str(msg))
+            # Log full message to help debug
+            raise Exception(f"dxFeed error: {err_msg} | full_msg={json.dumps(msg)}")
+
+    if not authorized:
+        raise Exception("dxFeed WebSocket: timeout na autenticação (30s)")
+
+    # Request FEED channel
+    ws.send(json.dumps({
+        "type": "CHANNEL_REQUEST", "channel": 1,
+        "service": "FEED", "parameters": {"contract": "AUTO"}
+    }))
+
+    # Wait for CHANNEL_OPENED
+    deadline2 = time.time() + 15
+    while time.time() < deadline2:
+        try:
+            ws.settimeout(3)
+            raw = ws.recv()
+            if not raw or not raw.strip():
+                continue
+            msg = json.loads(raw)
+        except Exception:
+            continue
+
+        mtype = msg.get("type", "")
+        if mtype == "CHANNEL_OPENED" and msg.get("channel") == 1:
+            break
+        if mtype == "KEEPALIVE":
+            ws.send(json.dumps({"type": "KEEPALIVE", "channel": 0}))
+
+    return ws
+
+
+def get_futures_option_chain(access_token, tasty_symbol):
+    """
+    Fetch the full futures option chain from Tastytrade REST API.
+    Endpoint: GET /futures-option-chains/{contract_code}/nested
+    contract_code = "ES", "NQ", "CL", etc. (no leading slash)
+    
+    Returns dict: {expiration_date_str: [option_dicts]}
+    Each option: {streamer_symbol, strike, type ("C"/"P"), expiration}
+    
+    Real response example for a strike:
+    {
+      "strike-price": "5750.0",
+      "call": "./ESU4 EW4Q4 240823C5750",
+      "call-streamer-symbol": "./EW4Q24C5750:XCME",
+      "put": "./ESU4 EW4Q4 240823P5750",
+      "put-streamer-symbol": "./EW4Q24P5750:XCME"
+    }
+    """
+    contract_code = tasty_symbol.lstrip("/")  # "ES", "NQ", etc.
+    url = f"{TASTYTRADE_API}/futures-option-chains/{contract_code}/nested"
+    headers = {"Authorization": f"Bearer {access_token}"}
+
+    resp = requests.get(url, headers=headers, timeout=20)
+    if resp.status_code != 200:
+        raise Exception(
+            f"Erro ao buscar option chain ({resp.status_code}):\n"
+            f"URL: {url}\n"
+            f"Resposta: {resp.text[:500]}"
+        )
+
+    body = resp.json()
+    # body["data"]["future-option-chains"] is a list of chain objects
+    # each has "expirations" list, each expiration has "strikes" list
+    data = body.get("data", {})
+    
+    expirations = {}
+
+    # The API returns TWO relevant keys:
+    # 1. "futures"       -> list of contract months (e.g. /ESH6, /ESM6)
+    # 2. "option-chains" -> list of option chain objects, each with "expirations"
+    # We try both key names for safety
+    chain_list = (
+        data.get("option-chains") or
+        data.get("future-option-chains") or
+        []
+    )
+
+    for chain_obj in chain_list:
+        for exp_obj in chain_obj.get("expirations", []):
+            exp_date = exp_obj.get("expiration-date", "")
+            if not exp_date:
+                continue
+            options = []
+            for strike_obj in exp_obj.get("strikes", []):
+                try:
+                    strike_price = float(strike_obj.get("strike-price", 0))
+                except (ValueError, TypeError):
+                    continue
+
+                # Keys can be "call-streamer-symbol" / "put-streamer-symbol"
+                # OR just nested under "call" / "put" dicts
+                call_sym = strike_obj.get("call-streamer-symbol")
+                put_sym  = strike_obj.get("put-streamer-symbol")
+
+                # Fallback: sometimes nested as dict with "streamer-symbol" key
+                if not call_sym and isinstance(strike_obj.get("call"), dict):
+                    call_sym = strike_obj["call"].get("streamer-symbol")
+                if not put_sym and isinstance(strike_obj.get("put"), dict):
+                    put_sym = strike_obj["put"].get("streamer-symbol")
+
+                if call_sym:
+                    options.append({
+                        "streamer_symbol": call_sym,
+                        "strike": strike_price,
+                        "type": "C",
+                        "expiration": exp_date,
+                    })
+                if put_sym:
+                    options.append({
+                        "streamer_symbol": put_sym,
+                        "strike": strike_price,
+                        "type": "P",
+                        "expiration": exp_date,
+                    })
+
+            if options:
+                if exp_date not in expirations:
+                    expirations[exp_date] = options
+                else:
+                    expirations[exp_date].extend(options)
+
+    return expirations
+
+
+def parse_option_chain(chain_data):
+    """Legacy shim — chain_data is already the parsed expirations dict."""
+    return chain_data
+
+
+def get_futures_price_rest(access_token, tasty_symbol):
+    """
+    Get current front-month futures price via Tastytrade REST API.
+    Uses the /futures endpoint which returns mark/last price for each contract month.
+    """
+    contract_code = tasty_symbol.lstrip("/")
+    headers = {"Authorization": f"Bearer {access_token}"}
+    
+    try:
+        # Get all contract months for this root symbol
+        url = f"{TASTYTRADE_API}/futures-option-chains/{contract_code}/nested"
+        resp = requests.get(url, headers=headers, timeout=15)
+        if resp.status_code == 200:
+            body = resp.json().get("data", {})
+            futures_list = body.get("futures", [])
+            
+            # Find the active month contract
+            active = next((f for f in futures_list if f.get("active-month")), None)
+            if not active:
+                # Fall back to nearest expiration
+                from datetime import datetime
+                today = datetime.now().date()
+                future_contracts = [
+                    f for f in futures_list
+                    if f.get("expiration-date", "") >= str(today)
+                ]
+                active = min(future_contracts, key=lambda f: f["expiration-date"]) if future_contracts else None
+
+            if active:
+                # Use the contract symbol to get its price
+                contract_sym = active.get("symbol", "")  # e.g. "/ESH6"
+                sym_encoded = contract_sym.replace("/", "%2F")
+                price_url = f"{TASTYTRADE_API}/futures/{sym_encoded}"
+                price_resp = requests.get(price_url, headers=headers, timeout=10)
+                if price_resp.status_code == 200:
+                    pdata = price_resp.json().get("data", {})
+                    price = pdata.get("mark") or pdata.get("last-price") or pdata.get("mark-price")
+                    if price:
+                        return float(price)
+    except Exception:
+        pass
+    return None
+
+
+def get_active_streamer_symbol(access_token, tasty_symbol):
+    """
+    Get the dxFeed streamer symbol for the active futures contract month.
+    e.g. "/ESH26:XCME" for the active E-mini S&P 500 contract.
+    """
+    contract_code = tasty_symbol.lstrip("/")
+    headers = {"Authorization": f"Bearer {access_token}"}
+    try:
+        url = f"{TASTYTRADE_API}/futures-option-chains/{contract_code}/nested"
+        resp = requests.get(url, headers=headers, timeout=15)
+        if resp.status_code == 200:
+            futures_list = resp.json().get("data", {}).get("futures", [])
+            active = next((f for f in futures_list if f.get("active-month")), None)
+            if not active:
+                # Use next-active-month as fallback
+                active = next((f for f in futures_list if f.get("next-active-month")), None)
+            if active:
+                return active.get("streamer-symbol")  # e.g. "/ESH26:XCME"
+    except Exception:
+        pass
+    return None
+
+
+# ── WebSocket helpers ─────────────────────────────────────
+
+def connect_websocket(token):
+    """
+    Connect and authenticate with dxFeed WebSocket.
     Handles empty frames, keepalives, and out-of-order messages gracefully.
     """
     ws = create_connection(DXFEED_URL, timeout=20)
@@ -840,8 +1087,12 @@ def main():
             prog = st.empty()
             with st.spinner(f"Buscando Greeks para {len(opts)} opções..."):
                 try:
-                    prog.info(f"🔌 Obtendo tokens e conectando ao dxFeed...")
+                    prog.info(f"🔑 Obtendo tokens...")
                     _, streamer_token = get_fresh_tokens()
+                    # Show token preview for debugging
+                    token_preview = f"{streamer_token[:20]}...{streamer_token[-10:]}" if len(streamer_token) > 30 else streamer_token
+                    st.caption(f"Token: `{token_preview}` (len={len(streamer_token)})")
+                    prog.info(f"🔌 Conectando ao dxFeed WebSocket...")
                     ws = connect_websocket(streamer_token)
 
                     prog.info(f"📊 Coletando Greeks para {len(opts)} opções ({wait_seconds}s)...")
