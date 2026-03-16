@@ -16,24 +16,48 @@ import plotly.graph_objects as go
 from utils.auth import get_access_token, ensure_streamer_token, get_streamer_token
 
 
-def get_streamer_token_direct(access_token):
+def get_fresh_tokens():
     """
-    Fetch a fresh dxFeed streamer token with no file cache.
+    Fetch access token + streamer token in a single flow with no file cache.
+    Returns (access_token, streamer_token).
     Critical for Streamlit Cloud where the filesystem is not persistent.
-    Returns the token string immediately.
+    
+    IMPORTANT: Call this ONCE per WebSocket session. Calling get_access_token
+    multiple times invalidates previous tokens on the dxFeed side.
     """
-    resp = requests.get(
+    from utils.auth import load_credentials_from_env
+
+    # Step 1: Get access token via OAuth refresh flow
+    creds = load_credentials_from_env()
+    resp = requests.post(
+        "https://api.tastytrade.com/oauth/token",
+        data={
+            "grant_type": "refresh_token",
+            "refresh_token": creds["refresh_token"],
+            "client_id": creds["client_id"],
+            "client_secret": creds["client_secret"],
+        },
+        timeout=15
+    )
+    if resp.status_code != 200:
+        raise Exception(f"Falha ao obter access token: {resp.status_code} {resp.text[:200]}")
+    
+    access_token = resp.json()["access_token"]
+
+    # Step 2: Get streamer token using the access token just obtained
+    resp2 = requests.get(
         "https://api.tastyworks.com/api-quote-tokens",
         headers={"Authorization": f"Bearer {access_token}"},
         timeout=15
     )
-    if resp.status_code != 200:
-        raise Exception(f"Falha ao obter streamer token: {resp.status_code} {resp.text[:200]}")
-    data = resp.json().get("data", {})
-    token = data.get("token")
-    if not token:
-        raise Exception(f"Streamer token não encontrado na resposta: {resp.json()}")
-    return token
+    if resp2.status_code != 200:
+        raise Exception(f"Falha ao obter streamer token: {resp2.status_code} {resp2.text[:200]}")
+    
+    streamer_token = resp2.json().get("data", {}).get("token")
+    if not streamer_token:
+        raise Exception(f"Streamer token não encontrado: {resp2.json()}")
+    
+    return access_token, streamer_token
 from utils.gex_calculator import GEXCalculator
 
 st.set_page_config(
@@ -619,7 +643,7 @@ def main():
         if load_chain:
             with st.spinner(f"Buscando option chain de {cfg['tasty_symbol']}..."):
                 try:
-                    access_token = get_access_token()
+                    access_token, _ = get_fresh_tokens()
                     expirations = get_futures_option_chain(access_token, cfg["tasty_symbol"])
                     
                     if not expirations:
@@ -644,9 +668,8 @@ def main():
                         price = None
                         if active_streamer:
                             try:
-                                _at = get_access_token(force_refresh=True)
-                                token_ws = get_streamer_token_direct(_at)
-                                ws_p = connect_websocket(token_ws)
+                                _, _st = get_fresh_tokens()
+                                ws_p = connect_websocket(_st)
                                 # Try both Trade and Quote for the active contract
                                 ws_p.send(json.dumps({
                                     "type": "FEED_SUBSCRIPTION", "channel": 1,
@@ -817,13 +840,9 @@ def main():
             prog = st.empty()
             with st.spinner(f"Buscando Greeks para {len(opts)} opções..."):
                 try:
-                    prog.info(f"🔌 Obtendo token e conectando ao dxFeed...")
-                    # Always fetch a brand new streamer token right before connecting.
-                    # On Streamlit Cloud there is no persistent filesystem, so cached
-                    # tokens are unreliable. We fetch token + connect in one shot.
-                    access_token_fresh = get_access_token(force_refresh=True)
-                    token = get_streamer_token_direct(access_token_fresh)
-                    ws = connect_websocket(token)
+                    prog.info(f"🔌 Obtendo tokens e conectando ao dxFeed...")
+                    _, streamer_token = get_fresh_tokens()
+                    ws = connect_websocket(streamer_token)
 
                     prog.info(f"📊 Coletando Greeks para {len(opts)} opções ({wait_seconds}s)...")
                     option_data = fetch_greeks_for_options(ws, opts, wait_seconds)
