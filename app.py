@@ -289,24 +289,66 @@ def get_active_streamer_symbol(access_token, tasty_symbol):
 # ── WebSocket helpers ─────────────────────────────────────
 
 def connect_websocket(token):
-    ws = create_connection(DXFEED_URL, timeout=15)
+    """
+    Connect and authenticate with dxFeed WebSocket.
+    Handles empty frames, keepalives, and out-of-order messages gracefully.
+    """
+    ws = create_connection(DXFEED_URL, timeout=20)
+
+    # SETUP
     ws.send(json.dumps({
         "type": "SETUP", "channel": 0,
         "keepaliveTimeout": 60, "acceptKeepaliveTimeout": 60, "version": "1.0.0"
     }))
-    ws.recv()
-    while True:
-        msg = json.loads(ws.recv())
-        if msg.get("type") == "AUTH_STATE":
-            if msg["state"] == "UNAUTHORIZED":
+
+    # Wait for AUTH_STATE and authorize
+    authorized = False
+    for _ in range(20):
+        try:
+            raw = ws.recv()
+            if not raw:
+                continue
+            msg = json.loads(raw)
+        except (ValueError, Exception):
+            continue
+
+        mtype = msg.get("type")
+        if mtype == "SETUP":
+            continue
+        if mtype == "AUTH_STATE":
+            if msg.get("state") == "UNAUTHORIZED":
                 ws.send(json.dumps({"type": "AUTH", "channel": 0, "token": token}))
-            elif msg["state"] == "AUTHORIZED":
+            elif msg.get("state") == "AUTHORIZED":
+                authorized = True
                 break
+        if mtype == "KEEPALIVE":
+            ws.send(json.dumps({"type": "KEEPALIVE", "channel": 0}))
+
+    if not authorized:
+        raise Exception("dxFeed WebSocket: falha na autenticação")
+
+    # Request FEED channel
     ws.send(json.dumps({
         "type": "CHANNEL_REQUEST", "channel": 1,
         "service": "FEED", "parameters": {"contract": "AUTO"}
     }))
-    ws.recv()
+
+    # Wait for CHANNEL_OPENED
+    for _ in range(20):
+        try:
+            raw = ws.recv()
+            if not raw:
+                continue
+            msg = json.loads(raw)
+        except (ValueError, Exception):
+            continue
+
+        mtype = msg.get("type")
+        if mtype == "CHANNEL_OPENED" and msg.get("channel") == 1:
+            break
+        if mtype == "KEEPALIVE":
+            ws.send(json.dumps({"type": "KEEPALIVE", "channel": 0}))
+
     return ws
 
 
@@ -343,27 +385,44 @@ def fetch_greeks_for_options(ws, options, wait_seconds=20):
     while time.time() - start < wait_seconds:
         try:
             ws.settimeout(0.5)
-            msg = json.loads(ws.recv())
-            if msg.get("type") == "FEED_DATA":
-                for item in msg.get("data", []):
-                    sym = item.get("eventSymbol")
-                    if sym not in sym_info:
-                        continue
-                    if sym not in data:
-                        data[sym] = {
-                            "strike": sym_info[sym]["strike"],
-                            "type": sym_info[sym]["type"],
-                            "expiration": sym_info[sym].get("expiration", ""),
-                        }
-                    etype = item.get("eventType")
-                    if etype == "Greeks":
-                        data[sym]["gamma"] = item.get("gamma")
-                        data[sym]["delta"] = item.get("delta")
-                        data[sym]["iv"] = item.get("volatility")
-                    elif etype == "Summary":
-                        data[sym]["oi"] = item.get("openInterest")
-                    elif etype == "Trade":
-                        data[sym]["volume"] = item.get("dayVolume", 0)
+            raw = ws.recv()
+            if not raw:
+                continue
+            msg = json.loads(raw)
+
+            mtype = msg.get("type")
+
+            # Respond to keepalives so connection stays alive during long fetches
+            if mtype == "KEEPALIVE":
+                ws.send(json.dumps({"type": "KEEPALIVE", "channel": 0}))
+                continue
+
+            if mtype != "FEED_DATA":
+                continue
+
+            for item in msg.get("data", []):
+                sym = item.get("eventSymbol")
+                if sym not in sym_info:
+                    continue
+                if sym not in data:
+                    data[sym] = {
+                        "strike": sym_info[sym]["strike"],
+                        "type": sym_info[sym]["type"],
+                        "expiration": sym_info[sym].get("expiration", ""),
+                    }
+                etype = item.get("eventType")
+                if etype == "Greeks":
+                    data[sym]["gamma"] = item.get("gamma")
+                    data[sym]["delta"] = item.get("delta")
+                    data[sym]["iv"] = item.get("volatility")
+                elif etype == "Summary":
+                    data[sym]["oi"] = item.get("openInterest")
+                elif etype == "Trade":
+                    data[sym]["volume"] = item.get("dayVolume", 0)
+
+        except ValueError:
+            # Empty or malformed frame — skip
+            continue
         except Exception:
             continue
 
